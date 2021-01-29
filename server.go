@@ -148,6 +148,16 @@ type Reader interface {
 	ReadUDP(conn *net.UDPConn, timeout time.Duration) ([]byte, *SessionUDP, error)
 }
 
+// TCPMsgReader is an optional interface that Readers can implement to support
+// reading to an existing buffer (which reduces the number of allocations)
+type TCPMsgReader interface {
+	Reader
+
+	// ReadTCPMsg reads a raw message from a TCP connection to the specified buffer.
+	// Implementations may alter connection properties, for example the read-deadline.
+	ReadTCPMsg(conn net.Conn, buf []byte, timeout time.Duration) error
+}
+
 // PacketConnReader is an optional interface that Readers can implement to support using generic net.PacketConns.
 type PacketConnReader interface {
 	Reader
@@ -165,6 +175,7 @@ type defaultReader struct {
 }
 
 var _ PacketConnReader = defaultReader{}
+var _ TCPMsgReader = defaultReader{}
 
 func (dr defaultReader) ReadTCP(conn net.Conn, timeout time.Duration) ([]byte, error) {
 	return dr.readTCP(conn, timeout)
@@ -176,6 +187,10 @@ func (dr defaultReader) ReadUDP(conn *net.UDPConn, timeout time.Duration) ([]byt
 
 func (dr defaultReader) ReadPacketConn(conn net.PacketConn, timeout time.Duration) ([]byte, net.Addr, error) {
 	return dr.readPacketConn(conn, timeout)
+}
+
+func (dr defaultReader) ReadTCPMsg(conn net.Conn, buf []byte, timeout time.Duration) error {
+	return dr.readTCPMsg(conn, buf, timeout)
 }
 
 // DecorateReader is a decorator hook for extending or supplanting the functionality of a Reader.
@@ -205,6 +220,9 @@ type Server struct {
 	// Default buffer size to use to read incoming UDP messages. If not set
 	// it defaults to MinMsgSize (512 B).
 	UDPSize int
+	// Default buffer size to use to read incoming TCP messages. If not set
+	// it defaults to DefaultMsgSize (4096 B).
+	TCPSize int
 	// The net.Conn.SetReadTimeout value for new connections, defaults to 2 * time.Second.
 	ReadTimeout time.Duration
 	// The net.Conn.SetWriteTimeout value for new connections, defaults to 2 * time.Second.
@@ -257,6 +275,9 @@ func (srv *Server) init() {
 
 	if srv.UDPSize == 0 {
 		srv.UDPSize = MinMsgSize
+	}
+	if srv.TCPSize == 0 {
+		srv.TCPSize = DefaultMsgSize
 	}
 	if srv.MsgAcceptFunc == nil {
 		srv.MsgAcceptFunc = DefaultMsgAcceptFunc
@@ -536,6 +557,7 @@ func (srv *Server) serveTCPConn(wg *sync.WaitGroup, rw net.Conn) {
 	if srv.DecorateReader != nil {
 		reader = srv.DecorateReader(reader)
 	}
+	readerTCP, canReadTCPMsg := reader.(TCPMsgReader)
 
 	idleTimeout := tcpIdleTimeout
 	if srv.IdleTimeout != nil {
@@ -549,13 +571,22 @@ func (srv *Server) serveTCPConn(wg *sync.WaitGroup, rw net.Conn) {
 		limit = maxTCPQueries
 	}
 
+	var buf []byte
+	if canReadTCPMsg {
+		buf = make([]byte, srv.TCPSize)
+	}
 	for q := 0; (q < limit || limit == -1) && srv.isStarted(); q++ {
-		m, err := reader.ReadTCP(w.tcp, timeout)
+		var err error
+		if canReadTCPMsg {
+			err = readerTCP.ReadTCPMsg(w.tcp, buf, timeout)
+		} else {
+			buf, err = reader.ReadTCP(w.tcp, timeout)
+		}
 		if err != nil {
 			// TODO(tmthrgd): handle error
 			break
 		}
-		srv.serveDNS(m, w)
+		srv.serveDNS(buf, w)
 		if w.closed {
 			break // Close() was called
 		}
@@ -648,6 +679,33 @@ func (srv *Server) serveDNS(m []byte, w *response) {
 	}
 
 	srv.Handler.ServeDNS(w, req) // Writes back to the client
+}
+
+func (srv *Server) readTCPMsg(conn net.Conn, buf []byte, timeout time.Duration) error {
+	// If we race with ShutdownContext, the read deadline may
+	// have been set in the distant past to unblock the read
+	// below. We must not override it, otherwise we may block
+	// ShutdownContext.
+	srv.lock.RLock()
+	if srv.started {
+		conn.SetReadDeadline(time.Now().Add(timeout))
+	}
+	srv.lock.RUnlock()
+
+	var length uint16
+	if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
+		return err
+	}
+
+	if len(buf) < int(length) {
+		return ErrBuf
+	}
+
+	if _, err := io.ReadAtLeast(conn, buf, int(length)); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (srv *Server) readTCP(conn net.Conn, timeout time.Duration) ([]byte, error) {
