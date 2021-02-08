@@ -701,7 +701,7 @@ func (srv *Server) readTCPMsg(conn net.Conn, buf []byte, timeout time.Duration) 
 		return ErrBuf
 	}
 
-	if _, err := io.ReadAtLeast(conn, buf, int(length)); err != nil {
+	if _, err := io.ReadAtLeast(conn, buf[:length], int(length)); err != nil {
 		return err
 	}
 
