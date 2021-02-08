@@ -207,7 +207,7 @@ type Server struct {
 	// it defaults to MinMsgSize (512 B).
 	UDPSize int
 	// Default buffer size to use to read incoming TCP messages. If not set
-	// it defaults to DefaultMsgSize (4096 B).
+	// it defaults to MinMsgSize (512 B).
 	TCPSize int
 	// The net.Conn.SetReadTimeout value for new connections, defaults to 2 * time.Second.
 	ReadTimeout time.Duration
@@ -252,7 +252,7 @@ func (srv *Server) isStarted() bool {
 	return started
 }
 
-func makeUDPBuffer(size int) func() interface{} {
+func makePacketBuffer(size int) func() interface{} {
 	return func() interface{} {
 		return make([]byte, size)
 	}
@@ -266,7 +266,7 @@ func (srv *Server) init() {
 		srv.UDPSize = MinMsgSize
 	}
 	if srv.TCPSize == 0 {
-		srv.TCPSize = DefaultMsgSize
+		srv.TCPSize = MinMsgSize
 	}
 	if srv.MsgAcceptFunc == nil {
 		srv.MsgAcceptFunc = DefaultMsgAcceptFunc
@@ -275,8 +275,8 @@ func (srv *Server) init() {
 		srv.Handler = DefaultServeMux
 	}
 
-	srv.udpPool.New = makeUDPBuffer(srv.UDPSize)
-	srv.tcpPool.New = makeUDPBuffer(srv.TCPSize)
+	srv.udpPool.New = makePacketBuffer(srv.UDPSize)
+	srv.tcpPool.New = makePacketBuffer(srv.TCPSize)
 }
 
 func unlockOnce(l sync.Locker) func() {
