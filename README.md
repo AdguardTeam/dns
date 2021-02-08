@@ -3,6 +3,8 @@
 A fork of miekg/dns that we use in AdGuard DNS. Some minor changes are implemented compared to the upstream:
 
 * TCP server - reduce the number of allocations.
+* TCP server - process queries in separate go-routines.
+* maxTCPQueries is set to -1 (it's no more needed to have it limited).
 
 [![Build Status](https://travis-ci.org/miekg/dns.svg?branch=master)](https://travis-ci.org/miekg/dns)
 [![Code Coverage](https://img.shields.io/codecov/c/github/miekg/dns/master.svg)](https://codecov.io/github/miekg/dns?branch=master)

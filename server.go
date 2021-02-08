@@ -15,7 +15,8 @@ import (
 )
 
 // Default maximum number of TCP queries before we close the socket.
-const maxTCPQueries = 128
+// Previously, it was 128, but with the current changes this limit is not needed anymore.
+const maxTCPQueries = -1
 
 // aLongTimeAgo is a non-zero time, far in the past, used for
 // immediate cancelation of network operations.
@@ -148,16 +149,6 @@ type Reader interface {
 	ReadUDP(conn *net.UDPConn, timeout time.Duration) ([]byte, *SessionUDP, error)
 }
 
-// TCPMsgReader is an optional interface that Readers can implement to support
-// reading to an existing buffer (which reduces the number of allocations)
-type TCPMsgReader interface {
-	Reader
-
-	// ReadTCPMsg reads a raw message from a TCP connection to the specified buffer.
-	// Implementations may alter connection properties, for example the read-deadline.
-	ReadTCPMsg(conn net.Conn, buf []byte, timeout time.Duration) error
-}
-
 // PacketConnReader is an optional interface that Readers can implement to support using generic net.PacketConns.
 type PacketConnReader interface {
 	Reader
@@ -175,7 +166,6 @@ type defaultReader struct {
 }
 
 var _ PacketConnReader = defaultReader{}
-var _ TCPMsgReader = defaultReader{}
 
 func (dr defaultReader) ReadTCP(conn net.Conn, timeout time.Duration) ([]byte, error) {
 	return dr.readTCP(conn, timeout)
@@ -187,10 +177,6 @@ func (dr defaultReader) ReadUDP(conn *net.UDPConn, timeout time.Duration) ([]byt
 
 func (dr defaultReader) ReadPacketConn(conn net.PacketConn, timeout time.Duration) ([]byte, net.Addr, error) {
 	return dr.readPacketConn(conn, timeout)
-}
-
-func (dr defaultReader) ReadTCPMsg(conn net.Conn, buf []byte, timeout time.Duration) error {
-	return dr.readTCPMsg(conn, buf, timeout)
 }
 
 // DecorateReader is a decorator hook for extending or supplanting the functionality of a Reader.
@@ -254,6 +240,9 @@ type Server struct {
 
 	// A pool for UDP message buffers.
 	udpPool sync.Pool
+
+	// A pool for TCP message buffers.
+	tcpPool sync.Pool
 }
 
 func (srv *Server) isStarted() bool {
@@ -287,6 +276,7 @@ func (srv *Server) init() {
 	}
 
 	srv.udpPool.New = makeUDPBuffer(srv.UDPSize)
+	srv.tcpPool.New = makeUDPBuffer(srv.TCPSize)
 }
 
 func unlockOnce(l sync.Locker) func() {
@@ -557,7 +547,6 @@ func (srv *Server) serveTCPConn(wg *sync.WaitGroup, rw net.Conn) {
 	if srv.DecorateReader != nil {
 		reader = srv.DecorateReader(reader)
 	}
-	readerTCP, canReadTCPMsg := reader.(TCPMsgReader)
 
 	idleTimeout := tcpIdleTimeout
 	if srv.IdleTimeout != nil {
@@ -571,22 +560,17 @@ func (srv *Server) serveTCPConn(wg *sync.WaitGroup, rw net.Conn) {
 		limit = maxTCPQueries
 	}
 
-	var buf []byte
-	if canReadTCPMsg {
-		buf = make([]byte, srv.TCPSize)
-	}
+	var wgCo sync.WaitGroup
+
 	for q := 0; (q < limit || limit == -1) && srv.isStarted(); q++ {
-		var err error
-		if canReadTCPMsg {
-			err = readerTCP.ReadTCPMsg(w.tcp, buf, timeout)
-		} else {
-			buf, err = reader.ReadTCP(w.tcp, timeout)
-		}
+		m, err := reader.ReadTCP(w.tcp, timeout)
+
 		if err != nil {
 			// TODO(tmthrgd): handle error
 			break
 		}
-		srv.serveDNS(buf, w)
+
+		go srv.serveTCPPacket(&wgCo, m, w)
 		if w.closed {
 			break // Close() was called
 		}
@@ -598,6 +582,9 @@ func (srv *Server) serveTCPConn(wg *sync.WaitGroup, rw net.Conn) {
 		timeout = idleTimeout
 	}
 
+	// Wait until all queries are processed
+	wgCo.Wait()
+
 	if !w.hijacked {
 		w.Close()
 	}
@@ -606,6 +593,14 @@ func (srv *Server) serveTCPConn(wg *sync.WaitGroup, rw net.Conn) {
 	delete(srv.conns, w.tcp)
 	srv.lock.Unlock()
 
+	wg.Done()
+}
+
+// Serve a new TCP request.
+func (srv *Server) serveTCPPacket(wg *sync.WaitGroup, m []byte, w *response) {
+	wg.Add(1)
+	srv.serveDNS(m, w)
+	srv.tcpPool.Put(m[:srv.TCPSize])
 	wg.Done()
 }
 
@@ -681,33 +676,6 @@ func (srv *Server) serveDNS(m []byte, w *response) {
 	srv.Handler.ServeDNS(w, req) // Writes back to the client
 }
 
-func (srv *Server) readTCPMsg(conn net.Conn, buf []byte, timeout time.Duration) error {
-	// If we race with ShutdownContext, the read deadline may
-	// have been set in the distant past to unblock the read
-	// below. We must not override it, otherwise we may block
-	// ShutdownContext.
-	srv.lock.RLock()
-	if srv.started {
-		conn.SetReadDeadline(time.Now().Add(timeout))
-	}
-	srv.lock.RUnlock()
-
-	var length uint16
-	if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
-		return err
-	}
-
-	if len(buf) < int(length) {
-		return ErrBuf
-	}
-
-	if _, err := io.ReadAtLeast(conn, buf[:length], int(length)); err != nil {
-		return err
-	}
-
-	return nil
-}
-
 func (srv *Server) readTCP(conn net.Conn, timeout time.Duration) ([]byte, error) {
 	// If we race with ShutdownContext, the read deadline may
 	// have been set in the distant past to unblock the read
@@ -724,8 +692,15 @@ func (srv *Server) readTCP(conn net.Conn, timeout time.Duration) ([]byte, error)
 		return nil, err
 	}
 
-	m := make([]byte, length)
-	if _, err := io.ReadFull(conn, m); err != nil {
+	m := srv.tcpPool.Get().([]byte)
+	if int(length) > len(m) {
+		srv.tcpPool.Put(m)
+		return nil, ErrBuf
+	}
+
+	m = m[:length]
+	if _, err := io.ReadAtLeast(conn, m, int(length)); err != nil {
+		srv.tcpPool.Put(m[:srv.TCPSize])
 		return nil, err
 	}
 
